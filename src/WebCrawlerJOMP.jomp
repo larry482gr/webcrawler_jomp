@@ -1,0 +1,284 @@
+import jomp.runtime.*;
+import java.net.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashSet;
+import java.io.*;
+import org.jsoup.Jsoup;
+
+public class WebCrawlerJOMP {
+    public static void main(String[] args) throws Exception {
+         boolean word_exists = false;
+         boolean parent_site = true;
+         boolean valid_site = true;
+         String validLink = "";
+         HashSet crawledList = new HashSet();
+         ArrayList links = new ArrayList();
+         ArrayList tmplinks = new ArrayList();
+         ArrayList tmp_links = new ArrayList();
+         ArrayList links_to_add = new ArrayList();
+         String txt = null;
+         String title = null;
+         int level = 1;
+         Date start_date = new Date();
+         int cores = Runtime.getRuntime().availableProcessors();
+         OMP.setNumThreads(cores);
+         int tmpLinksCounter = 0;
+         
+    	// Define starting url, depth and whether
+        // to limit crawling in specified host or not
+    	BufferedReader stdIn = new BufferedReader(new InputStreamReader(System.in));
+    	String urlstr = null;
+    	do {	
+    		System.out.println("Please type a valid starting URL");
+    		try {
+				urlstr = stdIn.readLine().toLowerCase();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+    		//omp parallel shared (valid_site)
+    		{
+    			//omp sections
+    			{
+    				//omp section
+    				{
+    					if (!RetrieveLinks.validSite(urlstr))
+						valid_site = false;
+					}
+					//omp section
+    				{
+    					if (!RetrieveLinks.validMimeType(urlstr))
+						valid_site = false;
+					}
+				}		
+			}
+			
+    	} while (!valid_site);
+		System.out.println("Please select depth");
+		int depth = 1;
+		try {
+			depth = Integer.valueOf(stdIn.readLine());
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		
+		String lim = null;
+		boolean limit = true;
+		System.out.println("Limit crawling in this host? [Y/n]");
+		try {
+			lim = stdIn.readLine();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		// In case of wrong input limit takes its default value (true)
+		if (lim.equalsIgnoreCase("y"))
+			limit = true;
+		else if ((lim.equalsIgnoreCase("n")))
+			limit = false;
+		
+		stdIn.close();
+        URL url = new URL(urlstr); // example: http://www.uom.gr/index.php
+        
+        /**
+         * TODO Set DB Server IP address, create database 'webcrawler', and set proper credentials.
+         * DB Schema:
+         * 1. Table: urls, Columns: id, url, title
+         * 2. Table: wordfreq, Columns: id, word, url, freq
+         */
+        
+        String db = "jdbc:mysql://127.0.0.1:3306/webcrawler?useUnicode=true&characterEncoding=UTF-8";
+		String username = "[YOUR_USERNAME_HERE]";
+		String password = "[YOUR_PASSWORD_HERE]";
+		Connection con = DriverManager.getConnection(db, username, password);
+		
+		//Retrieve sites already crawled from the database
+		Statement st = con.createStatement();
+		String query = "SELECT url FROM urls";
+		ResultSet rs = st.executeQuery(query);	
+		while (rs.next()) {
+			crawledList.add(rs.getString(1));
+		}
+		// Retrieve links
+		System.out.print("\nPlease wait while links from " + urlstr + " are being retrieved... ");
+        String body = Jsoup.parse(url, 60000).body().toString();
+    	tmplinks = RetrieveLinks.retrieveLinks(body);
+    	//omp parallel shared(links)
+    	{
+    		//omp for schedule (dynamic, 4)
+    		for(tmpLinksCounter = 0; tmpLinksCounter < tmplinks.size(); tmpLinksCounter++) {
+    			validLink = RetrieveLinks.validateLink(url, tmplinks.get(tmpLinksCounter).toString(), links, crawledList, limit);
+    			//omp critical
+    			{
+    				if(!validLink.isEmpty() && !links.contains(validLink))
+    					links.add(validLink);
+    			}		
+    		}	
+    	}
+    	tmplinks.clear();
+    	
+       	int sites_to_crawl = links.size()+1;
+    	// if starting url has already been crawled, try to start with the first link
+    	if (crawledList.contains(url.toString())) {
+    		links.remove(url.toString());
+	    	if (!links.isEmpty()){
+    			url = new URL(links.get(0).toString());
+    			sites_to_crawl--;
+    		}	
+    	}
+    	System.out.print(sites_to_crawl + " sites to crawl");
+    	
+    	while (depth > 0){
+    		// While there are more links search them one by one
+    		while (!links.isEmpty()){
+    			// Retrieve site 's title
+    			title = Jsoup.parse(url, 60000).title();
+        	
+    			System.out.println("\nCrawling... " + title + " (" + url.toString() + ")");
+        
+    			if (title.contains("'")) {
+    				title = title.replaceAll("'", "\\\\\'");
+    			}
+    			if (title.contains("\"")) {
+    				title = title.replaceAll("\"", "\\\\\"");
+    			}
+    			// Insert site 's url and title to the database
+    			st.execute("INSERT INTO urls VALUES (NULL, '" + url + "', '" + title + "')");
+    			
+    			// Retrieve site 's body
+    			body = Jsoup.parse(url, 60000).body().toString();
+    		
+    			// Retrieve plain text from site 's body (clear html tags)
+    			txt = Jsoup.parse(body).text();
+    					
+				// Split text to words wherever -, / or whitespace (\s) is present
+    			String reg_split = "(-|/|\\s)";
+    			String[] words = txt.split(reg_split);
+    			
+    			// Set regex to: Any of English or Greek characters
+    			// followed by one of these characters: !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+    			String regex = "(((\\p{L})|(\\p{InGreek}))+(\\p{Punct}){1})";
+    			
+    			String word;
+    			//omp parallel
+    			{
+    				//omp for schedule (dynamic, 4)
+    				for (int i = 0; i < words.length; i++)
+    				{
+    					word = words[i];
+    					// Check for some symbols or common words
+    					// bigger than 3 letters to ignore them
+    					if (word.startsWith("("))
+    						word = word.substring(1);
+        				
+    					if (word.endsWith(")"))
+    						word = word.substring(0, word.length()-1);
+        			
+    					if (word.matches(regex))
+    						word = word.substring(0, word.length()-1);
+    					else if (word.endsWith("'s"))
+    						word = word.substring(0, word.length()-2);
+    					else if (word.matches("this") || word.matches("that") || word.matches("these") || word.matches("those") ||
+    							 word.matches("from") || word.matches("what") || word.matches("where"))
+    						word = "";
+    					else if (word.contains("'"))
+    						word = word.replaceAll("'", "\\\\\'");
+    					else if (word.contains("\""))
+            				word = word.replaceAll("\"", "\\\\\"");
+        				
+    					if (!word.matches("(((\\p{L})|(\\p{InGreek}))+)"))
+    						word = "";
+        			
+    					word_exists = false;
+    					
+    					// Accept words longer than 3 and
+    					// up to 40 letters (to prevent faults on sql INSERT)
+    					if (word.length() > 3 && word.length() < 40) {
+    					//omp critical
+    					{
+    						Statement st2 = con.createStatement();
+    						query = "SELECT * FROM wordfreq WHERE word = '" + word + "' AND url = '" + url.toString() + "'";
+    						rs = st.executeQuery(query);
+    						// if word exists in the database, update its frequency
+    						while (rs.next()) {
+    							st2.execute("UPDATE wordfreq SET freq = freq+1 WHERE word = '" + rs.getString(1) + "' AND url = '" + rs.getString(2) + "'");
+    							st2.close();
+    							word_exists = true;
+    						}
+    						// else insert the combination word/url and set its frequency to 1
+    						if (!word_exists) {
+    							st2.execute("INSERT INTO wordfreq VALUES (NULL, '" + word.toLowerCase() + "', '" + url.toString() + "', 1)");
+    							st2.close();
+    						}
+    					}	
+    					}
+    				}
+    			}
+    			System.out.println(title + " (" + url.toString() + ") Successfully crawled!");
+    			
+    			// add starting site to crawled list, remove from links (if it existed)
+    			// and copy links to tmp_links (for next level of depth)
+    			if (parent_site) {
+    				crawledList.add(url.toString());
+    				for (int i = 0; i < links.size(); i++) {
+    					if (links.get(i).toString().equalsIgnoreCase(url.toString()))
+    						links.remove(i);
+    				}
+    				tmp_links.addAll(links);
+    				parent_site = false;
+    			}
+    			// add site just crawled to crawled list and
+    			// remove from remaining links to crawl
+    			else {
+    				crawledList.add(url.toString());
+    				links.remove(url.toString());
+    			}
+    			
+    			// check if next link is valid. If not delete it, pick the next one etc.
+    			if (!links.isEmpty()) {
+    				url = new URL(links.get(0).toString());
+    			}
+    		}
+    		depth--;
+    		if (depth > 0) {
+    			System.out.println("\nLevel " + level + " crawling completed.\nStarting Level " + ++level + "...");
+    			links.clear();
+    			
+    			// Search by width
+    			// For every one of the sites just crawled retrieve its links and continue
+    			System.out.print("\nPlease wait while links for level " + level + " crawling are being retreived... ");
+    			for (int i = 0; i < tmp_links.size(); i++) {
+    				url = new URL(tmp_links.get(i).toString());
+    				body = Jsoup.parse(url, 60000).body().toString();
+    				tmplinks.clear();
+    				tmplinks = RetrieveLinks.retrieveLinks(body);
+    				//omp parallel shared(links)
+    				{
+    					//omp for schedule (dynamic, 4)
+    					for(int j = 0; j < tmplinks.size(); j++) {
+    						validLink = RetrieveLinks.validateLink(url, tmplinks.get(j).toString(), links, crawledList, limit);
+    						//omp critical
+    						{
+    							if(!validLink.isEmpty())
+    								links.add(validLink);
+    						}
+    					}
+    				}
+    			}	
+    			tmp_links.clear();
+    			tmp_links.addAll(links);
+    			System.out.print(links.size() + " sites to crawl");
+    			if (!links.isEmpty())
+    				url = new URL(links.get(0).toString());
+    		}
+    	}
+    	st.close();
+		con.close();
+    	Date finish_date = new Date();
+    	System.out.println("\nStart Date: " + start_date);
+    	System.out.println("Finish Date: " + finish_date);
+    }
+}
